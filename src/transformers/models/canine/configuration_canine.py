@@ -14,9 +14,12 @@
 # limitations under the License.
 """ CANINE model configuration"""
 
+from collections import OrderedDict
+from typing import Any, Mapping, Optional, Union
+
 from ...configuration_utils import PretrainedConfig
 from ...utils import logging
-
+from ...onnx import OnnxConfig
 
 logger = logging.get_logger(__name__)
 
@@ -137,3 +140,38 @@ class CanineConfig(PretrainedConfig):
         self.num_hash_functions = num_hash_functions
         self.num_hash_buckets = num_hash_buckets
         self.local_transformer_stride = local_transformer_stride
+
+
+# TODO: WIP
+class CanineOnnxConfig(OnnxConfig):
+    @property
+    def inputs(self) -> Mapping[str, Mapping[int, str]]:
+        # if self.task == "multiple-choice":
+        #     dynamic_axis = {0: "batch", 1: "choice", 2: "sequence"}
+        # else:
+        #     dynamic_axis = {0: "batch", 1: "sequence"}
+        common_inputs = OrderedDict({"input_ids": {0: "batch", 1: "sequence"}})
+        common_inputs["attention_mask"] = {0: "batch", 1: "sequence"}
+        common_inputs["token_type_ids"] = {0: "batch", 1: "sequence"}
+
+        return common_inputs
+
+    def generate_dummy_inputs(
+        self,
+        preprocessor: Union["PreTrainedTokenizerBase", "FeatureExtractionMixin"],
+        batch_size: int = -1,
+        seq_length: int = -1,
+        num_choices: int = -1,
+        is_pair: bool = False,
+        framework: Optional["TensorType"] = None,
+        tokenizer: "PreTrainedTokenizerBase" = None,
+    ) -> Mapping[str, Any]:
+        dummy_inputs = super().generate_dummy_inputs(
+            preprocessor, batch_size=batch_size, seq_length=seq_length, is_pair=is_pair, framework=framework
+        )
+
+        return dummy_inputs
+
+    @property
+    def default_onnx_opset(self) -> int:
+        return 13

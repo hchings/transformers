@@ -210,6 +210,14 @@ class FeaturesManager:
             "question-answering",
             onnx_config_cls="models.camembert.CamembertOnnxConfig",
         ),
+        "canine": supported_features_mapping(
+            "default",
+            "multiple-choice",
+            "sequence-classification",
+            "token-classification",
+            "question-answering",
+            onnx_config_cls="models.canine.CanineOnnxConfig",
+        ),
         "clip": supported_features_mapping(
             "default",
             onnx_config_cls="models.clip.CLIPOnnxConfig",
