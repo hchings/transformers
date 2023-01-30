@@ -28,8 +28,10 @@ import logging
 import math
 import os
 import random
+import time
 from itertools import chain
 from pathlib import Path
+import numpy as np
 
 import datasets
 import torch
@@ -55,9 +57,11 @@ from transformers import (
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
 
+from memory_tracker import memory_status
+
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.27.0.dev0")
+# check_min_version("4.27.0.dev0")
 
 logger = get_logger(__name__)
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
@@ -67,6 +71,7 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a Masked Language Modeling task")
+    parser.add_argument("--local_rank", type=int, default=0)
     parser.add_argument(
         "--dataset_name",
         type=str,
@@ -227,6 +232,12 @@ def parse_args():
             "Only applicable when `--with_tracking` is passed."
         ),
     )
+    parser.add_argument(
+        "--logging_steps",
+        type=int,
+        default=10,
+        help="Log every X updates steps.",
+    )
     args = parser.parse_args()
 
     # Sanity checks
@@ -248,8 +259,29 @@ def parse_args():
     return args
 
 
+def compute_num_params(model):
+    num_params = 0
+    seen = set()
+    for p in model.parameters():
+        if p not in seen:
+            seen.add(p)
+            if hasattr(p, "ds_shape"):
+                num_params += np.prod(p.ds_shape)
+            else:
+                #print("p", p.name())
+                num_params += np.prod(p.size())
+
+    return num_params
+
 def main():
     args = parse_args()
+
+    global_rank = int(os.environ['RANK'])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ['WORLD_SIZE'])
+    device = local_rank
+
+    print("global_rank=%s, local_rank=%s, world_size=%s" % (global_rank, local_rank, world_size))
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
@@ -264,7 +296,9 @@ def main():
         accelerator_log_kwargs["log_with"] = args.report_to
         accelerator_log_kwargs["logging_dir"] = args.output_dir
 
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs)
+    # device_placement = False
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps,
+                              **accelerator_log_kwargs)
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -349,6 +383,11 @@ def main():
                 split=f"train[{args.validation_split_percentage}%:]",
             )
 
+    print(raw_datasets)
+    raw_datasets["train"] = raw_datasets["train"].select(range(50000))
+    raw_datasets["validation"] = raw_datasets["validation"].select(range(1000))
+    print(raw_datasets)
+
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
@@ -365,7 +404,8 @@ def main():
         logger.warning("You are instantiating a new config instance from scratch.")
 
     if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
+        # tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
+        tokenizer = AutoTokenizer.from_pretrained("klue/roberta-small", use_fast=not args.use_slow_tokenizer)
     elif args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
     else:
@@ -383,6 +423,8 @@ def main():
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForMaskedLM.from_config(config)
+
+    num_params = compute_num_params(model)
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
@@ -611,12 +653,15 @@ def main():
     progress_bar.update(starting_epoch * num_update_steps_per_epoch)
     completed_steps = starting_epoch * num_update_steps_per_epoch
 
+    total_steps = 0
+    start = time.time()
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         if args.with_tracking:
             total_loss = 0
         for step, batch in enumerate(train_dataloader):
-            # We need to skip steps until we reach the resumed step
+            step_start = time.time()
+
             if args.resume_from_checkpoint and epoch == starting_epoch:
                 if resume_step is not None and step < resume_step:
                     if step % args.gradient_accumulation_steps == 0:
@@ -631,9 +676,31 @@ def main():
                 if args.with_tracking:
                     total_loss += loss.detach().float()
                 accelerator.backward(loss)
+
+                memory_status(msg="After_train_step")
+
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+
+            # 'input_ids', 'token_type_ids', 'attention_mask', 'labels'
+            input_ids = batch["input_ids"]
+
+            step_time = time.time() - step_start
+            total_steps += 1
+            time_elapsed = time.time() - start
+            sample_processed = input_ids.shape[0] * world_size # dp_size
+            throughput = sample_processed / step_time
+            tokens_per_gpu = input_ids.shape[0] * input_ids.shape[1]
+            # Based on the formula in https://developer.nvidia.com/blog/scaling-language-model-training-to-a-trillion-parameters-using-megatron/
+            tflops_per_gpu = 8 * num_params * tokens_per_gpu / step_time / 1e12
+
+            if not total_steps % args.logging_steps and global_rank == 0:
+                print(
+                    f"num_params {num_params}, tokens_per_gpu {tokens_per_gpu}, step_time {step_time}, input_ids.shape[0] {input_ids.shape[0]}, input_ids.shape[1], {input_ids.shape[1]}, sample_processed {sample_processed}")
+                print(
+                    f"({int(time_elapsed)}s), Batch {total_steps - 1} Loss: {loss.item()}, Speed: {throughput} samples/sec, TFLOPS/GPU: {tflops_per_gpu}"
+                )
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
