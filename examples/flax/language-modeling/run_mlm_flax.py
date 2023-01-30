@@ -66,6 +66,11 @@ MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 
+def compute_num_params(model):
+    """Get num params."""
+    # https://github.com/google/jax/discussions/6153
+    return sum(x.size for x in jax.tree_leaves(model.params))
+
 @dataclass
 class TrainingArguments:
     output_dir: str = field(
@@ -507,9 +512,11 @@ def main():
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
-    if model_args.tokenizer_name:
+    if model_args.tokenizer_name or True:
+        logging.info("use default tokenizer")
         tokenizer = AutoTokenizer.from_pretrained(
-            model_args.tokenizer_name,
+            # model_args.tokenizer_name,
+            "klue/roberta-small",
             cache_dir=model_args.cache_dir,
             use_fast=model_args.use_fast_tokenizer,
             use_auth_token=True if model_args.use_auth_token else None,
@@ -528,6 +535,13 @@ def main():
         )
 
     # Preprocessing the datasets.
+
+    # TODO: clean up
+    print(datasets)
+    datasets["train"] = datasets["train"].select(range(10000))
+    datasets["validation"] = datasets["validation"].select(range(1000))
+    print(datasets)
+
     # First we tokenize all the texts.
     if training_args.do_train:
         column_names = datasets["train"].column_names
@@ -647,16 +661,20 @@ def main():
             dtype=getattr(jnp, model_args.dtype),
         )
 
+    num_params = compute_num_params(model)
+
     if training_args.gradient_checkpointing:
         model.enable_gradient_checkpointing()
 
     # Store some constant
     num_epochs = int(training_args.num_train_epochs)
+    # GBS
     train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count()
     per_device_eval_batch_size = int(training_args.per_device_eval_batch_size)
     eval_batch_size = per_device_eval_batch_size * jax.device_count()
 
     num_train_steps = len(tokenized_datasets["train"]) // train_batch_size * num_epochs
+    print("per_device_train_batch_size=%s\n, train_batch_size=%s\n, eval_batch_size=%s" % (training_args.per_device_train_batch_size, train_batch_size, eval_batch_size))
 
     # Create learning rate schedule
     warmup_fn = optax.linear_schedule(
@@ -773,6 +791,7 @@ def main():
     # Replicate the train state on each device
     state = jax_utils.replicate(state)
 
+    start = time.time()
     train_time = 0
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
     for epoch in epochs:
@@ -789,14 +808,31 @@ def main():
         train_samples_idx = np.random.permutation(np.arange(num_train_samples))
         train_batch_idx = generate_batch_splits(train_samples_idx, train_batch_size)
 
+        print("num_train_samples", num_train_samples) # 53956
+        print("train_batch_idx", len(train_batch_idx), len(train_batch_idx[0])) # [total: 53760] ~52 [iteration], 1024[samples].  210, 256
+
         # Gather the indexes for creating the batch and do a training step
         for step, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
             samples = [tokenized_datasets["train"][int(idx)] for idx in batch_idx]
-            model_inputs = data_collator(samples, pad_to_multiple_of=16)
 
+            # (GBS, seq_lenth)
+            model_inputs = data_collator(samples, pad_to_multiple_of=16)
+            step_start = time.time()
             # Model forward
+            # (# of GPU, per GPU BS, seq_length)
             model_inputs = shard(model_inputs.data)
-            state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
+
+            # state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
+            # Use this line for benchmark
+            state, train_metric, dropout_rngs = jax.block_until_ready(p_train_step(state, model_inputs, dropout_rngs))
+
+            # calculate throughput
+            time_elapsed = time.time() - start
+            step_time = time.time() - step_start
+            sample_processed = len(samples) # same as GBS
+            throughput = sample_processed / step_time    # block_until_ready?
+            tokens_per_gpu = model_inputs["input_ids"].shape[1] * model_inputs["input_ids"].shape[2]
+
             train_metrics.append(train_metric)
 
             cur_step = epoch * (num_train_samples // train_batch_size) + step
@@ -814,6 +850,19 @@ def main():
                 )
 
                 train_metrics = []
+
+                # log throughput
+                # Based on the formula in https://developer.nvidia.com/blog/scaling-language-model-training-to-a-trillion-parameters-using-megatron/
+                # TODO: cleanup
+                tflops_per_gpu = 8 * num_params * tokens_per_gpu / step_time / 1e12
+                print("step_time", step_time)
+                print("sample_processed", sample_processed)
+                print("tokens_per_gpu", tokens_per_gpu)
+                print("num_params", num_params)
+                print("(%ds), Batch %d Loss: %s, Speed: %s samples/sec, TFLOPS/GPU: %s" % (
+                    int(time_elapsed), step, train_metric['loss'],
+                    throughput, tflops_per_gpu))
+
 
             if cur_step % training_args.eval_steps == 0 and cur_step > 0:
                 # ======================== Evaluating ==============================

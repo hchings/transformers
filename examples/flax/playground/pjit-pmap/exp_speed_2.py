@@ -126,6 +126,7 @@ variables = model.init(rngs=jax.random.PRNGKey(0), x=x)
 print_model_size(variables)
 
 def step(x, variables):
+    # shaped array
     return model.apply(variables, x)
 
 # Compute pmap or pjit functions
