@@ -534,13 +534,9 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
-    # Preprocessing the datasets.
-
-    # TODO: clean up
-    print(datasets)
+    # Only tokenize a subset of data as we don't need to run til converge
     datasets["train"] = datasets["train"].select(range(10000))
     datasets["validation"] = datasets["validation"].select(range(1000))
-    print(datasets)
 
     # First we tokenize all the texts.
     if training_args.do_train:
@@ -645,6 +641,7 @@ def main():
     # Initialize our training
     rng = jax.random.PRNGKey(training_args.seed)
     dropout_rngs = jax.random.split(rng, jax.local_device_count())
+    logger.info("local_device_count:", jax.local_device_count())
 
     if model_args.model_name_or_path:
         model = FlaxAutoModelForMaskedLM.from_pretrained(
@@ -674,7 +671,7 @@ def main():
     eval_batch_size = per_device_eval_batch_size * jax.device_count()
 
     num_train_steps = len(tokenized_datasets["train"]) // train_batch_size * num_epochs
-    print("per_device_train_batch_size=%s\n, train_batch_size=%s\n, eval_batch_size=%s" % (training_args.per_device_train_batch_size, train_batch_size, eval_batch_size))
+    logger.info("per_device_train_batch_size=%s\n, train_batch_size=%s\n, eval_batch_size=%s" % (training_args.per_device_train_batch_size, train_batch_size, eval_batch_size))
 
     # Create learning rate schedule
     warmup_fn = optax.linear_schedule(
@@ -808,9 +805,6 @@ def main():
         train_samples_idx = np.random.permutation(np.arange(num_train_samples))
         train_batch_idx = generate_batch_splits(train_samples_idx, train_batch_size)
 
-        print("num_train_samples", num_train_samples) # 53956
-        print("train_batch_idx", len(train_batch_idx), len(train_batch_idx[0])) # [total: 53760] ~52 [iteration], 1024[samples].  210, 256
-
         # Gather the indexes for creating the batch and do a training step
         for step, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
             samples = [tokenized_datasets["train"][int(idx)] for idx in batch_idx]
@@ -853,13 +847,8 @@ def main():
 
                 # log throughput
                 # Based on the formula in https://developer.nvidia.com/blog/scaling-language-model-training-to-a-trillion-parameters-using-megatron/
-                # TODO: cleanup
                 tflops_per_gpu = 8 * num_params * tokens_per_gpu / step_time / 1e12
-                print("step_time", step_time)
-                print("sample_processed", sample_processed)
-                print("tokens_per_gpu", tokens_per_gpu)
-                print("num_params", num_params)
-                print("(%ds), Batch %d Loss: %s, Speed: %s samples/sec, TFLOPS/GPU: %s" % (
+                logger.info("(%ds), Batch %d Loss: %s, Speed: %s samples/sec, TFLOPS/GPU: %s" % (
                     int(time_elapsed), step, train_metric['loss'],
                     throughput, tflops_per_gpu))
 
